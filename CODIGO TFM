@@ -1,1 +1,179 @@
+import os
+import pandas as pd
+import numpy as np
+import tempfile
+import gradio as gr
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import shapiro
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score, confusion_matrix, classification_report
+from scipy.stats.mstats import winsorize
 
+# Modelos Clasificadores (Los 7 solicitados)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import cross_val_score, cross_val_predict, StratifiedKFold
+
+# --- CONSTANTES ---
+FEATURES_LIST = ['Torque', 'ROP', 'Inclination', 'DLS', 'SPP', 'SectionLength']
+complexity_colors = {'Low Complexity': 'green', 'High Complexity': 'red'}
+LABELS_ORDER_2 = ['Low Complexity', 'High Complexity']
+
+# Variables Globales
+best_model_prod = None
+global_scaler = None
+global_weights = None
+global_stats = None
+winner_name = ""
+
+def procesar_analisis_tesis(files, w_sec, w_inc, w_tor, w_dls, w_spp, w_rop):
+    global best_model_prod, global_scaler, global_weights, global_stats, winner_name
+    if not files: return [None] * 17
+
+    # Sincronización de pesos
+    w_dict = {'Torque': w_tor, 'ROP': w_rop, 'Inclination': w_inc, 'DLS': w_dls, 'SPP': w_spp, 'SectionLength': w_sec}
+    global_weights = np.array([w_dict[c] for c in FEATURES_LIST])
+    
+    column_map = {'Depth (ft)': 'Depth', 'ROPins (ft/h)': 'ROP', 'Surface Torque (klbf.ft)': 'Torque',
+                  'Stand Pipe Pressure (psi)': 'SPP', 'Incl': 'Inclination', 'DLS': 'DLS'}
+
+    resumen_pozos = []
+    for file in files:
+        path = file.name if hasattr(file, 'name') else file
+        df_t = pd.read_excel(path).rename(columns=column_map)
+        df_t = df_t.dropna(subset=['Depth'])
+        pozo_d = {col: np.mean(winsorize(df_t[col].dropna().astype(float), limits=[0.05, 0.05])) if col in df_t.columns else 0 for col in ['Torque', 'ROP', 'Inclination', 'DLS', 'SPP']}
+        pozo_d['SectionLength'] = df_t['Depth'].max() - df_t['Depth'].min()
+        pozo_d['Pozo'] = os.path.basename(path).replace('.xlsx', '')
+        resumen_pozos.append(pozo_d)
+
+    df_res = pd.DataFrame(resumen_pozos)
+    X = df_res[FEATURES_LIST]
+    global_stats = X.describe(percentiles=[.25, .75]).T
+    global_scaler = StandardScaler()
+    X_scaled = global_scaler.fit_transform(X)
+
+    # 1. MATRIZ DE CORRELACIÓN
+    fig_corr = px.imshow(X.corr(), text_auto=".2f", color_continuous_scale='RdBu_r', title="Matriz de Correlación")
+
+    # 2. CLUSTERING K=2
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(X_scaled)
+    c_sums = df_res.groupby(labels)[['Torque', 'Inclination']].mean().sum(axis=1)
+    high_idx = c_sums.idxmax()
+    df_res['Complexity'] = pd.Series(labels).map({high_idx: 'High Complexity', (1-high_idx): 'Low Complexity'})
+    y = df_res['Complexity']
+
+    # 3. BENCHMARKING CLASIFICADORES (7 MODELOS)
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    modelos = {
+        "K-Neighbors": KNeighborsClassifier(n_neighbors=3),
+        "Random Forest": RandomForestClassifier(n_estimators=500, random_state=42),
+        "Gaussian NB": GaussianNB(),
+        "Logistic Regression": LogisticRegression(random_state=42),
+        "LDA": LinearDiscriminantAnalysis(),
+        "Decision Tree": DecisionTreeClassifier(random_state=42),
+        "Neural Network (MLP)": MLPClassifier(hidden_layer_sizes=(10,10), max_iter=2000, random_state=42)
+    }
+
+    bench_results = []
+    best_acc = -1
+    for name, model in modelos.items():
+        scores = cross_val_score(model, X, y, cv=skf)
+        mean_acc = scores.mean()
+        bench_results.append({"Modelo": name, "Accuracy Mean": round(mean_acc, 4), "Accuracy Std": round(scores.std(), 4)})
+        if mean_acc > best_acc:
+            best_acc = mean_acc
+            winner_name = name
+
+    df_bench_class = pd.DataFrame(bench_results).sort_values("Accuracy Mean", ascending=False)
+    
+    # Entrenar el ganador para producción sobre X_scaled con pesos
+    X_weighted = X_scaled * global_weights
+    best_model_prod = modelos[winner_name].fit(X_weighted, y)
+
+    # Matriz y Reporte
+    y_pred = cross_val_predict(modelos[winner_name], X, y, cv=skf)
+    df_report = pd.DataFrame(classification_report(y, y_pred, target_names=LABELS_ORDER_2, output_dict=True)).transpose().round(4)
+    cm = confusion_matrix(y, y_pred, labels=LABELS_ORDER_2)
+    fig_cm, ax = plt.subplots(figsize=(4,3))
+    sns.heatmap(cm, annot=True, cmap='Greens', fmt='g', xticklabels=LABELS_ORDER_2, yticklabels=LABELS_ORDER_2)
+    plt.tight_layout()
+
+    # 4. BENCHMARKING CLUSTERING (KM, GMM, DBSCAN)
+    km_s = silhouette_score(X_scaled, labels)
+    gmm_s = silhouette_score(X_scaled, GaussianMixture(n_components=2, random_state=42).fit_predict(X_scaled))
+    db_labels = DBSCAN(eps=1.5, min_samples=2).fit_predict(X_scaled)
+    db_s = silhouette_score(X_scaled, db_labels) if len(set(db_labels)) > 1 else 0
+    
+    df_sil = pd.DataFrame({"Algoritmo": ["K-Means", "GMM", "DBSCAN"], "Silhouette Score": [km_s, gmm_s, db_s]})
+    fig_sil = px.bar(df_sil, x="Algoritmo", y="Silhouette Score", text="Silhouette Score", color="Algoritmo", title="Benchmarking de Clustering")
+
+    # PCA
+    pca_res = PCA(n_components=2).fit_transform(X_scaled)
+    df_res['PC1'], df_res['PC2'] = pca_res[:,0], pca_res[:,1]
+    fig_pca = px.scatter(df_res, x='PC1', y='PC2', text='Pozo', color='Complexity', color_discrete_map=complexity_colors)
+
+    # Boxplots
+    box_figs = [px.box(df_res, x='Complexity', y=v, color='Complexity', color_discrete_map=complexity_colors, points="all", title=f"Distribución: {v}") for v in FEATURES_LIST]
+
+    return [df_res, fig_corr, fig_sil, df_sil, fig_pca, df_bench_class, px.bar(df_bench_class, x="Modelo", y="Accuracy Mean"), df_report, fig_cm, *box_figs]
+
+def recomendar_inteligente(tor, rop, inc, dls, spp, sec):
+    if best_model_prod is None: return "Error", "Ejecute análisis primero."
+    vals = {'Torque': tor, 'ROP': rop, 'Inclination': inc, 'DLS': dls, 'SPP': spp, 'SectionLength': sec}
+    
+    for col in FEATURES_LIST:
+        if vals[col] == 0:
+            es_high = (inc > global_stats.loc['Inclination', '50%'] or tor > global_stats.loc['Torque', '50%'])
+            vals[col] = global_stats.loc[col, '75%'] if es_high else global_stats.loc[col, '25%']
+            
+    vec = pd.DataFrame([vals])[FEATURES_LIST]
+    v_scaled = global_scaler.transform(vec)
+    v_weighted = v_scaled * global_weights
+    pred = best_model_prod.predict(v_weighted)[0]
+    
+    if pred == 'High Complexity':
+        msg = "🔺 ALTA COMPLEJIDAD: Se requiere asegurar el uso de LUBRICANTE DE ALTO DESEMPEÑO (Premium) y supervisión técnica."
+    else:
+        msg = "✅ BAJA COMPLEJIDAD: Oportunidad operativa para evaluar el uso de lubricantes de DESEMPEÑO ESTÁNDAR y optimizar costos."
+    
+    return pred, msg
+
+with gr.Blocks() as miApp:
+    gr.Markdown("# 🎓 Dashboard de Tesis: Benchmarking de Modelos (K=2)")
+    with gr.Row():
+        f_in = gr.File(file_count="multiple")
+        with gr.Column():
+            sl_tor = gr.Slider(0, 5, 2, label="Peso Torque"); sl_rop = gr.Slider(0, 5, 1.5, label="Peso ROP")
+            sl_inc = gr.Slider(0, 5, 2, label="Peso Inclination"); sl_dls = gr.Slider(0, 5, 1.5, label="Peso DLS")
+            sl_spp = gr.Slider(0, 5, 1, label="Peso SPP"); sl_sec = gr.Slider(0, 5, 2, label="Peso SectionLength")
+            btn = gr.Button("🚀 EJECUTAR ANÁLISIS", variant="primary")
+    with gr.Tabs():
+        with gr.TabItem("1. EDA"): out_corr = gr.Plot(); out_table = gr.Dataframe()
+        with gr.TabItem("2. Validación Clustering"): out_sil_p = gr.Plot(); out_sil_t = gr.Dataframe()
+        with gr.TabItem("3. PCA"): out_pca = gr.Plot()
+        with gr.TabItem("4. Benchmarking Clasificadores"): out_bench_t = gr.Dataframe(); out_bench_p = gr.Plot(); out_rep = gr.Dataframe(); out_cm = gr.Plot()
+        with gr.TabItem("5. Distribuciones"): b_outs = [gr.Plot() for _ in FEATURES_LIST]
+
+    gr.Markdown("## 🤖 Recomendador Inteligente")
+    with gr.Row():
+        in_tor = gr.Number(label="Torque"); in_rop = gr.Number(label="ROP"); in_inc = gr.Number(label="Inclination")
+        in_dls = gr.Number(label="DLS"); in_spp = gr.Number(label="SPP"); in_sec = gr.Number(label="SectionLength")
+    btn_rec = gr.Button("🔍 PREDECIR"); r_out = [gr.Textbox(label="Nivel Estimado"), gr.Textbox(label="Recomendación Técnica")]
+
+    btn.click(procesar_analisis_tesis, [f_in, sl_sec, sl_inc, sl_tor, sl_dls, sl_spp, sl_rop], [out_table, out_corr, out_sil_p, out_sil_t, out_pca, out_bench_t, out_bench_p, out_rep, out_cm, *b_outs])
+    btn_rec.click(recomendar_inteligente, [in_tor, in_rop, in_inc, in_dls, in_spp, in_sec], r_out)
+
+miApp.launch(debug=True)
